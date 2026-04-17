@@ -1,0 +1,381 @@
+"""
+Build PipelineConfig from a JSON-like dict (e.g. request body).
+Paths are resolved relative to base_dir (e.g. API workspace or temp dir).
+"""
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from autodistil_kg.pipeline.config import (
+    PipelineConfig,
+    ChatMLConverterStageConfig,
+    FineTunerStageConfig,
+    EvaluatorStageConfig,
+    GraphTraverserStageConfig,
+)
+from autodistil_kg.pipeline.interfaces import PipelineContext
+
+
+def _resolve_path(path: Optional[str], base: Path, is_output: bool = False) -> Optional[str]:
+    """Resolve a relative path against *base* (the run directory).
+
+    For **input** paths (``is_output=False``): if the file does not exist
+    relative to *base*, falls back to the global ``WORKSPACE`` root so
+    uploaded files and legacy data can be found.
+
+    For **output** paths (``is_output=True``): always resolves relative to
+    *base* so each run gets its own isolated outputs.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_absolute():
+        resolved = (base / p).resolve()
+        if is_output:
+            # Output paths always resolve to the per-run directory
+            return str(resolved)
+        if resolved.exists():
+            return str(resolved)
+        # Fall back to workspace root (e.g. for uploaded files in WORKSPACE/uploads/)
+        from .state import WORKSPACE
+        ws_resolved = (WORKSPACE / p).resolve()
+        if ws_resolved.exists():
+            return str(ws_resolved)
+        # Default to base-relative even if not yet created
+        return str(resolved)
+    return str(p)
+
+
+def _graph_db_from_dict(data: dict) -> "GraphDatabaseConfig":
+    """Build GraphDatabaseConfig from request payload (e.g. graph_traverser.neo4j)."""
+    from autodistil_kg.graph_traverser.graph_db.config import GraphDatabaseConfig
+    return GraphDatabaseConfig(
+        provider="neo4j",
+        uri=data.get("uri") or "bolt://localhost:7687",
+        user=data.get("username") or data.get("user") or "neo4j",
+        password=data.get("password") or "",
+        database=data.get("database") or None,
+    )
+
+
+def _state_storage_from_dict(data: dict) -> "StateStorageConfig":
+    """Build StateStorageConfig from request payload (e.g. graph_traverser.redis)."""
+    from autodistil_kg.graph_traverser.state_storage.config import StateStorageConfig
+    port = data.get("port", 6379)
+    if isinstance(port, str):
+        port = int(port, 10)
+    db = data.get("db", 0)
+    if isinstance(db, str):
+        db = int(db, 10)
+    return StateStorageConfig(
+        provider="redis",
+        host=data.get("host", "localhost"),
+        port=port,
+        db=db,
+        password=data.get("password") or None,
+        key_prefix=data.get("key_prefix", "graph_traverser:"),
+    )
+
+
+def _llm_config_from_dict(data: dict) -> "LLMConfig":
+    """Build LLMConfig from request payload (e.g. graph_traverser.llm)."""
+    from autodistil_kg.llm.config import LLMConfig
+    return LLMConfig(
+        provider=(data.get("provider") or "openai").lower(),
+        api_key=data.get("api_key") or None,
+        model=data.get("model") or None,
+        base_url=data.get("base_url") or None,
+        project_id=data.get("project_id") or None,
+        location=data.get("location") or None,
+        credentials_path=data.get("credentials_path") or None,
+        additional_params=data.get("additional_params") or {},
+    )
+
+
+def _parse_graph_traverser_config(gt_data: dict, base: Path) -> GraphTraverserStageConfig:
+    """Build GraphTraverserStageConfig from dict. Uses credentials from request when provided, else .env."""
+    from pathlib import Path
+    try:
+        from autodistil_kg.graph_traverser.env_config import (
+            load_env_file,
+            get_graph_db_config_from_env,
+            get_llm_config_from_env,
+            get_state_storage_config_from_env,
+        )
+        from autodistil_kg.graph_traverser.config import TraversalConfig, DatasetGenerationConfig, TraversalStrategy
+    except ImportError as e:
+        raise ImportError(
+            "Graph traverser requires python-dotenv and LLM SDKs. "
+            "Install in the Autodistil-KG environment."
+        ) from e
+
+    # Optional: load .env for fallback when request does not provide credentials
+    env_loaded = False
+    env_path = base / ".env"
+    if env_path.exists():
+        load_env_file(str(env_path))
+        env_loaded = True
+    else:
+        for parent in [base, Path.cwd(), Path(__file__).resolve().parents[2]]:
+            ep = parent / ".env"
+            if ep.exists():
+                load_env_file(str(ep))
+                env_loaded = True
+                break
+
+    # Graph DB: from request neo4j dict or env
+    if gt_data.get("neo4j") and isinstance(gt_data["neo4j"], dict):
+        graph_db = _graph_db_from_dict(gt_data["neo4j"])
+    elif env_loaded:
+        graph_db = get_graph_db_config_from_env()
+    else:
+        raise ValueError(
+            "Graph traverser needs Neo4j credentials. Either set graph_traverser.neo4j in the request "
+            "(uri, username, password, database) or provide a .env with NEO4J_*."
+        )
+
+    # State storage (Redis): from request redis dict or env
+    if gt_data.get("redis") and isinstance(gt_data["redis"], dict):
+        state_storage = _state_storage_from_dict(gt_data["redis"])
+    elif env_loaded:
+        state_storage = get_state_storage_config_from_env()
+    else:
+        raise ValueError(
+            "Graph traverser needs Redis credentials. Either set graph_traverser.redis in the request "
+            "(host, port, db, password, key_prefix) or provide a .env with REDIS_*."
+        )
+
+    # LLM: from request llm dict or env
+    if gt_data.get("llm") and gt_data["llm"].get("provider"):
+        llm_config = _llm_config_from_dict(gt_data["llm"])
+    elif env_loaded:
+        llm_config = get_llm_config_from_env(provider=gt_data.get("llm_provider"))
+    else:
+        raise ValueError(
+            "Graph traverser needs LLM credentials. Either set graph_traverser.llm in the request "
+            "(provider, api_key, model, etc.) or provide a .env with OPENAI_API_KEY / GEMINI_* / CLAUDE_* / etc."
+        )
+
+    t = gt_data.get("traversal") or {}
+    strategy_str = (t.get("strategy") or "bfs").lower()
+    try:
+        strategy = TraversalStrategy(strategy_str)
+    except ValueError:
+        strategy = TraversalStrategy.BFS
+    traversal = TraversalConfig(
+        strategy=strategy,
+        max_nodes=t.get("max_nodes", 500),
+        max_depth=t.get("max_depth", 5),
+        relationship_types=t.get("relationship_types"),
+        node_labels=t.get("node_labels"),
+        seed_node_ids=t.get("seed_node_ids"),
+        reasoning_depth=t.get("reasoning_depth", 2),
+        max_paths_per_node=t.get("max_paths_per_node", 15),
+        path_batch_size=t.get("path_batch_size", 5),
+        num_workers=t.get("num_workers", 1),
+    )
+
+    d = gt_data.get("dataset") or {}
+    output_path = _resolve_path(gt_data.get("output_path") or d.get("output_path"), base, is_output=True) or str(base / "output" / "dataset.jsonl")
+
+    # Alignment config
+    from autodistil_kg.graph_traverser.config import AlignmentConfig
+    a = gt_data.get("alignment") or d.get("alignment") or {}
+    ref_path = _resolve_path(a.get("reference_texts_path"), base) if a.get("reference_texts_path") else None
+    alignment = AlignmentConfig(
+        domain_focus=a.get("domain_focus") or None,
+        domain_keywords=a.get("domain_keywords", []),
+        style_guide=a.get("style_guide") or None,
+        target_audience=a.get("target_audience") or None,
+        max_answer_length=a.get("max_answer_length"),
+        min_answer_length=a.get("min_answer_length"),
+        quality_filter=a.get("quality_filter", False),
+        quality_threshold=a.get("quality_threshold", 0.7),
+        reference_texts_path=ref_path,
+    )
+
+    dataset = DatasetGenerationConfig(
+        seed_prompts=d.get("seed_prompts", ["What can you tell me about this node? Describe: {properties}"]),
+        system_message=d.get("system_message"),
+        prompt_template=d.get("prompt_template"),
+        include_metadata=d.get("include_metadata", True),
+        output_format=d.get("output_format", "jsonl"),
+        output_path=output_path,
+        alignment=alignment,
+        eval_sample_ratio=d.get("eval_sample_ratio", 0.2),
+        eval_rephrase=d.get("eval_rephrase", True),
+    )
+
+    return GraphTraverserStageConfig(
+        graph_db=graph_db,
+        llm_config=llm_config,
+        state_storage=state_storage,
+        traversal=traversal,
+        dataset=dataset,
+        output_path=output_path,
+    )
+
+
+def config_from_dict(data: Dict[str, Any], base_dir: Path) -> PipelineConfig:
+    """Build PipelineConfig from a dict (e.g. POST body). Paths resolved relative to base_dir.
+
+    When stages don't specify explicit input/output paths, sensible defaults
+    are derived from ``base_dir`` so the pipeline works end-to-end without
+    the user having to wire every path manually.
+
+    Default paths (under ``base_dir``):
+        graph_traverser  → output/dataset.jsonl
+        chatml_converter → input: output/dataset.jsonl  output: output/prepared.jsonl
+        finetuner        → train: output/prepared.jsonl  output: output/finetuned
+        evaluator        → eval:  output/dataset_eval.jsonl  model: output/finetuned  report: output/eval_report.json
+    """
+    # Canonical default paths for the run directory
+    _defaults = {
+        "chatml":    str(base_dir / "output" / "dataset.jsonl"),
+        "prepared":  str(base_dir / "output" / "prepared.jsonl"),
+        "eval_data": str(base_dir / "output" / "prepared_eval.jsonl"),
+        "model":     str(base_dir / "output" / "finetuned"),
+        "eval_report": str(base_dir / "output" / "eval_report.json"),
+    }
+
+    def _cc(d):
+        if not d:
+            return None
+        return ChatMLConverterStageConfig(
+            input_path=_resolve_path(d.get("input_path"), base_dir) or _defaults["chatml"],
+            output_path=_resolve_path(d.get("output_path"), base_dir, is_output=True) or _defaults["prepared"],
+            prepare_for_finetuning=d.get("prepare_for_finetuning", True),
+            chat_template=d.get("chat_template"),
+        )
+
+    def _ft(d):
+        if not d:
+            return None
+        return FineTunerStageConfig(
+            model_name=d.get("model_name", "unsloth/gemma-2-2b-it"),
+            model_type=d.get("model_type"),
+            train_data_path=_resolve_path(d.get("train_data_path"), base_dir) or _defaults["prepared"],
+            eval_data_path=_resolve_path(d.get("eval_data_path"), base_dir),
+            output_dir=_resolve_path(d.get("output_dir"), base_dir, is_output=True) or _defaults["model"],
+            max_seq_length=d.get("max_seq_length", 2048),
+            num_train_epochs=d.get("num_train_epochs", 1),
+            per_device_train_batch_size=d.get("per_device_train_batch_size", 2),
+            learning_rate=d.get("learning_rate", 2e-4),
+        )
+
+    ev = data.get("evaluator")
+    evaluator = None
+    if ev:
+        graph_rag_config = None
+        if ev.get("graph_rag_enabled") and ev.get("graph_rag_config"):
+            graph_rag_config = ev["graph_rag_config"]
+
+        # Eval dataset: prefer explicit, then eval file if it exists, then prepared
+        _eval_ds = _resolve_path(ev.get("eval_dataset_path"), base_dir)
+        if not _eval_ds:
+            from pathlib import Path as _P
+            _eval_candidate = _P(_defaults["eval_data"])
+            _eval_ds = str(_eval_candidate) if _eval_candidate.exists() else _defaults["prepared"]
+
+        # Only default model_path when user explicitly provided one.
+        # When omitted, leave it None so the evaluator stage can decide
+        # whether a local model is actually required (e.g. not needed when
+        # using an external base_model_provider or graph_rag).
+        _raw_model_path = ev.get("model_path")
+        _resolved_model_path = _resolve_path(_raw_model_path, base_dir) if _raw_model_path else None
+
+        evaluator = EvaluatorStageConfig(
+            model_path=_resolved_model_path,
+            eval_dataset_path=_eval_ds,
+            output_report_path=_resolve_path(ev.get("output_report_path"), base_dir, is_output=True) or _defaults["eval_report"],
+            metrics=ev.get("metrics"),
+            evalg_mode=ev.get("evalg_mode", "internal"),
+            max_new_tokens=ev.get("max_new_tokens", 2048),
+            max_seq_length=ev.get("max_seq_length", 4096),
+            base_model_provider=ev.get("base_model_provider") or None,
+            base_model_name=ev.get("base_model_name") or None,
+            base_model_api_key=ev.get("base_model_api_key") or None,
+            base_model_base_url=ev.get("base_model_base_url") or None,
+            graph_rag_config=graph_rag_config,
+            judge_provider=ev.get("judge_provider") or None,
+            judge_model=ev.get("judge_model") or None,
+            judge_api_key=ev.get("judge_api_key") or None,
+            judge_base_url=ev.get("judge_base_url") or None,
+            judge_max_tokens=ev.get("judge_max_tokens") or None,
+            eval_distilled=ev.get("eval_distilled"),
+            eval_base=ev.get("eval_base"),
+            eval_graph_rag=ev.get("eval_graph_rag"),
+            use_vllm=ev.get("use_vllm", False),
+            vllm_gpu_memory_utilization=ev.get("vllm_gpu_memory_utilization", 0.9),
+            vllm_max_model_len=ev.get("vllm_max_model_len"),
+            max_eval_samples=ev.get("max_eval_samples"),
+            additional_params=ev.get("additional_params", {}),
+        )
+
+    gt_data = data.get("graph_traverser")
+    graph_traverser = None
+    if gt_data:
+        graph_traverser = _parse_graph_traverser_config(gt_data, base_dir)
+
+    return PipelineConfig(
+        graph_traverser=graph_traverser,
+        chatml_converter=_cc(data.get("chatml_converter")),
+        finetuner=_ft(data.get("finetuner")),
+        evaluator=evaluator,
+        output_dir=_resolve_path(data.get("output_dir"), base_dir) if data.get("output_dir") else None,
+        run_stages=data.get("run_stages"),
+        log_level=data.get("log_level", "INFO"),
+        log_dir=str(base_dir / "logs"),
+    )
+
+
+def context_from_config(config: PipelineConfig) -> PipelineContext:
+    """Build initial PipelineContext from config.
+
+    Pre-populates context paths from each stage's explicit config fields so
+    that stages can run independently (without requiring a predecessor stage
+    to set the path in context).  Each stage's config already contains
+    sensible defaults (set by ``config_from_dict``), so this just threads
+    them through.
+    """
+    chatml_path = None
+    prepared_path = None
+    eval_dataset_path = None
+    model_output_path = None
+    eval_report_path = None
+
+    if config.graph_traverser and config.graph_traverser.output_path:
+        chatml_path = config.graph_traverser.output_path
+        # Derive eval path from the traverser's output (dataset_eval.jsonl)
+        from pathlib import Path as _P
+        _gp = _P(config.graph_traverser.output_path)
+        _gt_eval = _gp.parent / f"{_gp.stem}_eval{_gp.suffix}"
+        if _gt_eval.exists():
+            eval_dataset_path = str(_gt_eval)
+
+    if config.chatml_converter:
+        chatml_path = config.chatml_converter.input_path or chatml_path
+        prepared_path = config.chatml_converter.output_path or prepared_path
+        # Derive eval dataset path from the converter's output (sibling file),
+        # but only if the graph traverser didn't already provide one.
+        if prepared_path and not eval_dataset_path:
+            _pp = _P(prepared_path)
+            eval_dataset_path = str(_pp.parent / f"{_pp.stem}_eval{_pp.suffix}")
+
+    if config.finetuner:
+        prepared_path = config.finetuner.train_data_path or prepared_path
+        model_output_path = config.finetuner.output_dir or model_output_path
+
+    if config.evaluator:
+        model_output_path = config.evaluator.model_path or model_output_path
+        # Explicit eval_dataset_path from user overrides auto-derived one
+        if config.evaluator.eval_dataset_path:
+            eval_dataset_path = config.evaluator.eval_dataset_path
+        eval_report_path = config.evaluator.output_report_path or eval_report_path
+
+    return PipelineContext(
+        chatml_dataset_path=chatml_path,
+        prepared_dataset_path=prepared_path,
+        eval_dataset_path=eval_dataset_path,
+        model_output_path=model_output_path,
+        eval_report_path=eval_report_path,
+    )

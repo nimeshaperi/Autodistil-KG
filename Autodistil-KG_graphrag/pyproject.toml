@@ -1,0 +1,30 @@
+[project]
+name = "autodistil-kg-graphrag"
+version = "0.1.0"
+description = "Graph RAG implementation using LlamaIndex PropertyGraphIndex with Neo4j"
+authors = [
+    {name = "Nimeshaperi", email = "nimesha.periyap@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "llama-index-core",
+    "llama-index-llms-openai-like",
+    "requests",
+    "python-dotenv (>=1.2.1,<2.0.0)",
+]
+
+[tool.poetry]
+packages = [{include = "autodistil_kg_graphrag", from = "src"}]
+
+[tool.poetry.scripts]
+autodistil-kg-graphrag = "autodistil_kg_graphrag.run:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.1.0,<8.0.0)"
+]

@@ -1,0 +1,9 @@
+{
+  "output_dir": "./output",
+  "run_stages": ["chatml_converter"],
+  "chatml_converter": {
+    "input_path": "data/sample_chatml.jsonl",
+    "output_path": "output/prepared.jsonl",
+    "prepare_for_finetuning": true
+  }
+}

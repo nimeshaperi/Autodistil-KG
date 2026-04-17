@@ -1,0 +1,23 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dependencies
+node_modules
+
+# Build
+dist
+dist-ssr
+*.local
+
+# Editor
+.vite
+.idea
+*.swp
+*.swo
+
+# Env (keep .env.example)
+.env
+.env.local
+.env.*.local

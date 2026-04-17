@@ -1,0 +1,24 @@
+{
+  "output_dir": "./output",
+  "run_stages": ["graph_traverser", "chatml_converter"],
+  "graph_traverser": {
+    "output_path": "output/chatml.jsonl",
+    "traversal": {
+      "strategy": "bfs",
+      "max_nodes": 50,
+      "max_depth": 5
+    },
+    "dataset": {
+      "seed_prompts": [
+        "What can you tell me about this node? Describe: {properties}",
+        "Explain the context and relationships of this node: {properties}"
+      ],
+      "system_message": "You are a helpful assistant that explains knowledge graph nodes.",
+      "include_metadata": true
+    }
+  },
+  "chatml_converter": {
+    "output_path": "output/prepared.jsonl",
+    "prepare_for_finetuning": true
+  }
+}
